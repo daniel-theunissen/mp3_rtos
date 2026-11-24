@@ -22,7 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,6 +35,21 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define GET_LUX_FLAG (1U << 0)
+#define RUN_DAC_ADC_TEST
+#define ADC_MAX    4095.0f
+#define R_FIXED    1600.0f	// Fixed divider resistor
+#define LDR_K      4.45e4f  // Photoresistor extracted parameter
+#define LDR_GAMMA  0.632f  // Photoresistor extracted parameter
+#define NUM_LEDS 3
+#define HIGH_LUX_THRESHOLD 60.0f
+#define LOW_LUX_THRESHOLD 3.0f
+#define RAMP_RATE 0.01f
+#ifdef RUN_DAC_ADC_TEST
+	#define STATIC_LSB_TOLERANCE 20
+	#define INVERSE_GAIN_ERROR 200
+	#define SELF_TEST_DONE_FLAG (1U << 0)
+#endif
+#define BUFFER_SIZE 16
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,27 +61,48 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+DAC_HandleTypeDef hdac;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart2;
 
-/* Definitions for Get_LUX_Task */
-osThreadId_t Get_LUX_TaskHandle;
-const osThreadAttr_t Get_LUX_Task_attributes = {
-  .name = "Get_LUX_Task",
-  .stack_size = 512 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+/* Definitions for Update_LUX_Task */
+osThreadId_t Update_LUX_TaskHandle;
+const osThreadAttr_t Update_LUX_Task_attributes = {
+  .name = "Update_LUX_Task",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
 };
 /* Definitions for Update_PWM_Task */
 osThreadId_t Update_PWM_TaskHandle;
 const osThreadAttr_t Update_PWM_Task_attributes = {
   .name = "Update_PWM_Task",
-  .stack_size = 512 * 4,
+  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for Self_Test_Task */
+osThreadId_t Self_Test_TaskHandle;
+const osThreadAttr_t Self_Test_Task_attributes = {
+  .name = "Self_Test_Task",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for LUX_Mutex */
+osMutexId_t LUX_MutexHandle;
+const osMutexAttr_t LUX_Mutex_attributes = {
+  .name = "LUX_Mutex"
+};
 /* USER CODE BEGIN PV */
-
+uint16_t adc_buf[BUFFER_SIZE];
+static float lux;
+static const uint32_t LED_CH[NUM_LEDS] = {TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3};
+static float current_brightness[NUM_LEDS];
+static uint32_t arr;
+#ifdef RUN_DAC_ADC_TEST
+  static uint32_t failures = 0;
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,11 +113,24 @@ static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM1_Init(void);
-void Get_LUX(void *argument);
+static void MX_DAC_Init(void);
+void Update_LUX(void *argument);
 void Update_PWM(void *argument);
+void Run_Self_Test(void *argument);
 
 /* USER CODE BEGIN PFP */
-
+static float Avg_ADC_Value(void);
+static float ADC_To_LUX(float n);
+static float Clamp_To_Range(float n, float min, float max);
+static void Update_LEDs(float lux);
+#ifdef RUN_DAC_ADC_TEST
+	static void DAC_ADC_Test(void);
+	int _write(int file, char *ptr, int len);
+#endif
+static void LUX_Set(float n);
+static float LUX_Get(void);
+static void Start_Timers(void);
+static void Start_ADC(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -121,12 +172,17 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM2_Init();
   MX_TIM1_Init();
+  MX_DAC_Init();
   /* USER CODE BEGIN 2 */
+
 
   /* USER CODE END 2 */
 
   /* Init scheduler */
   osKernelInitialize();
+  /* Create the mutex(es) */
+  /* creation of LUX_Mutex */
+  LUX_MutexHandle = osMutexNew(&LUX_Mutex_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -145,11 +201,14 @@ int main(void)
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of Get_LUX_Task */
-  Get_LUX_TaskHandle = osThreadNew(Get_LUX, NULL, &Get_LUX_Task_attributes);
+  /* creation of Update_LUX_Task */
+  Update_LUX_TaskHandle = osThreadNew(Update_LUX, NULL, &Update_LUX_Task_attributes);
 
   /* creation of Update_PWM_Task */
   Update_PWM_TaskHandle = osThreadNew(Update_PWM, NULL, &Update_PWM_Task_attributes);
+
+  /* creation of Self_Test_Task */
+  Self_Test_TaskHandle = osThreadNew(Run_Self_Test, NULL, &Self_Test_Task_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -275,6 +334,46 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief DAC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC_Init(void)
+{
+
+  /* USER CODE BEGIN DAC_Init 0 */
+
+  /* USER CODE END DAC_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC_Init 1 */
+
+  /* USER CODE END DAC_Init 1 */
+
+  /** DAC Initialization
+  */
+  hdac.Instance = DAC;
+  if (HAL_DAC_Init(&hdac) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** DAC channel OUT1 config
+  */
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  if (HAL_DAC_ConfigChannel(&hdac, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC_Init 2 */
+
+  /* USER CODE END DAC_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -296,7 +395,7 @@ static void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 84;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 49999;
+  htim1.Init.Period = 11499;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -311,7 +410,7 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM2;
-  sConfigOC.Pulse = 150;
+  sConfigOC.Pulse = 250;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -322,7 +421,7 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 175;
+  sConfigOC.Pulse = 275;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
@@ -491,23 +590,166 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+// When the DMA is updated, set a flag in the Get_LUX task so that it knows to change the value
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc == &hadc1) osThreadFlagsSet(Update_LUX_TaskHandle, GET_LUX_FLAG);
+}
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc == &hadc1) osThreadFlagsSet(Update_LUX_TaskHandle, GET_LUX_FLAG);
+}
+
+static float Avg_ADC_Value(void) {
+    uint32_t sum = 0;
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+    	sum += adc_buf[i];
+    }
+
+    return sum / (float)BUFFER_SIZE;
+}
+
+static void Update_LEDs(float lux) {
+	// Based on the lux thresholds, linearly interpolate the log of the current lux to get a 'darkness' value
+	float darkness = (logf(HIGH_LUX_THRESHOLD / lux) / logf(HIGH_LUX_THRESHOLD / LOW_LUX_THRESHOLD));
+	darkness = Clamp_To_Range(darkness, 0.0f, 1.0f) * NUM_LEDS;
+	for (int i=0; i<NUM_LEDS; i++) {
+		float target_brightness = Clamp_To_Range((darkness - i), 0.0f, 1.0f);
+		float diff = Clamp_To_Range(target_brightness - current_brightness[i], -RAMP_RATE, RAMP_RATE);
+		current_brightness[i] += diff;
+		__HAL_TIM_SET_COMPARE(&htim2, LED_CH[i], (uint32_t)(current_brightness[i]*current_brightness[i]*(arr+1)));
+	}
+}
+
+static float ADC_To_LUX(float n) {
+    if (n < 1.0f) {
+    	n = 1.0f;
+    }
+
+    if (n > 4094.0f) {
+    	n = 4094.0f;
+    }
+
+    float r_ldr = R_FIXED * ((ADC_MAX / n) - 1.0f);
+
+    if (r_ldr < 1.0f) {
+    	r_ldr = 1.0f;
+    }
+
+    float lux = powf(LDR_K / r_ldr, 1.0f / LDR_GAMMA);
+    // This was the characterized range so I don't trust the value outside
+    lux = Clamp_To_Range(lux, 1e-3f, 1120.0f);
+    return lux;
+}
+
+static float Clamp_To_Range(float n, float min, float max) {
+	return (fminf(fmaxf(n, min), max));
+}
+
+static void  LUX_Set(float n) {
+    osMutexAcquire(LUX_MutexHandle, osWaitForever);
+    lux = n;
+    osMutexRelease(LUX_MutexHandle);
+}
+
+static float LUX_Get(void) {
+    osMutexAcquire(LUX_MutexHandle, osWaitForever);
+    float n = lux;
+    osMutexRelease(LUX_MutexHandle);
+    return n;
+}
+
+static void Start_Timers(void) {
+	HAL_TIM_Base_Start_IT(&htim2);
+
+	  for (int i=0; i<3; i++) {
+		  HAL_TIM_PWM_Start(&htim2, LED_CH[i]);
+	  }
+	  arr = __HAL_TIM_GET_AUTORELOAD(&htim2);
+
+
+	  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Controls ADC sampling
+	  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); // Controls photoresistor divider
+
+}
+
+static void Start_ADC(void) {
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buf, BUFFER_SIZE);
+}
+
+#ifdef RUN_DAC_ADC_TEST
+static void DAC_ADC_Test(void) {
+	// TBH I used chat to find out about this API
+	// But the idea is that I want to just use software polling for the test
+	// because it makes it less error-prone and AFAIK is okay given the requirements
+	hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+	hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+	HAL_ADC_Init(&hadc1);
+
+	ADC_ChannelConfTypeDef sConfig = {0};
+	sConfig.Channel = ADC_CHANNEL_4; // This is the sauce that makes hooks it up to the DAC
+	sConfig.Rank = 1;
+	sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+	HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+	HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
+//	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 0);
+//	osDelay(20);
+
+	for (int32_t dac_code=0; dac_code<4096; dac_code++) {
+		HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_code);
+		osDelay(2);
+		size_t sum = 0;
+		for (int i=0; i<16; i++) {
+			HAL_ADC_Start(&hadc1);
+			HAL_ADC_PollForConversion(&hadc1, 5);
+			sum += HAL_ADC_GetValue(&hadc1);
+		}
+		int32_t AVG_ADC_Value = sum/16;
+		int32_t LSB_Tolerance = STATIC_LSB_TOLERANCE + (dac_code/INVERSE_GAIN_ERROR);
+
+		if (abs(dac_code - AVG_ADC_Value) > LSB_Tolerance) {
+			failures++;
+			HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+			printf("FAIL dac_code=%lu AVG_ADC_Value=%ld\r\n", (unsigned long)dac_code, (long)AVG_ADC_Value);
+		}
+
+	}
+	printf("Self-test done: %lu failures\r\n", (unsigned long)failures);
+	HAL_DAC_Stop(&hdac, DAC_CHANNEL_1);
+	MX_ADC1_Init(); // Put everything back to how it was
+}
+
+int _write(int file, char *ptr, int len)
+{
+    while (HAL_UART_Transmit(&huart2, (uint8_t *)ptr, len, HAL_MAX_DELAY) == HAL_BUSY) { }
+    return len;
+}
+
+#endif
 
 /* USER CODE END 4 */
 
-/* USER CODE BEGIN Header_Get_LUX */
+/* USER CODE BEGIN Header_Update_LUX */
 /**
-  * @brief  Function implementing the Get_LUX_Task thread.
+  * @brief  Function implementing the Update_LUX_Task thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_Get_LUX */
-void Get_LUX(void *argument)
+/* USER CODE END Header_Update_LUX */
+void Update_LUX(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
+	#ifdef RUN_DAC_ADC_TEST
+	    osThreadFlagsWait(SELF_TEST_DONE_FLAG, osFlagsWaitAny, osWaitForever);
+	#endif
+	Start_Timers();
+	Start_ADC();
   for(;;)
   {
-    osDelay(1);
+
+	  osThreadFlagsWait(GET_LUX_FLAG, osFlagsWaitAny, osWaitForever);
+	  float temp_LUX = ADC_To_LUX(Avg_ADC_Value());
+	  LUX_Set(temp_LUX);
   }
   /* USER CODE END 5 */
 }
@@ -522,12 +764,34 @@ void Get_LUX(void *argument)
 void Update_PWM(void *argument)
 {
   /* USER CODE BEGIN Update_PWM */
+	float latest_LUX = LOW_LUX_THRESHOLD; // start off
   /* Infinite loop */
   for(;;)
   {
+	latest_LUX = LUX_Get();
+	Update_LEDs(latest_LUX);
     osDelay(1);
   }
   /* USER CODE END Update_PWM */
+}
+
+/* USER CODE BEGIN Header_Run_Self_Test */
+/**
+* @brief Function implementing the Self_Test_Task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_Run_Self_Test */
+void Run_Self_Test(void *argument)
+{
+  /* USER CODE BEGIN Run_Self_Test */
+	#ifdef RUN_DAC_ADC_TEST
+	DAC_ADC_Test();                                           // existing function
+	osThreadFlagsSet(Update_LUX_TaskHandle, SELF_TEST_DONE_FLAG);   // release the pipeline
+  	#endif
+	osThreadExit();
+
+  /* USER CODE END Run_Self_Test */
 }
 
 /**
